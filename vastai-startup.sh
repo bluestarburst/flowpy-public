@@ -30,37 +30,140 @@ wait_for_network() {
 
 wait_for_network
 
+# Check if we're running inside a Docker container (VastAI case)
+is_in_docker() {
+  if [ -f /.dockerenv ] || grep -q docker /proc/1/cgroup 2>/dev/null; then
+    return 0
+  fi
+  return 1
+}
+
 # Check if Docker is already installed and working
 check_docker() {
   if command -v docker >/dev/null 2>&1; then
     if docker --version >/dev/null 2>&1; then
-      echo "Docker is already installed: $(docker --version)"
+      echo "Docker client is installed: $(docker --version)"
       if docker info >/dev/null 2>&1; then
-        echo "Docker daemon is running"
+        echo "Docker daemon is accessible and running"
         return 0
       else
-        echo "Docker installed but daemon not running, starting service..."
-        systemctl start docker 2>/dev/null || service docker start 2>/dev/null || true
-        sleep 2
-        if docker info >/dev/null 2>&1; then
-          echo "Docker daemon started successfully"
-          return 0
-        fi
+        echo "Docker client installed but cannot connect to daemon"
+        return 1
       fi
     fi
   fi
   return 1
 }
 
-# Install Docker if needed
-if ! check_docker; then
-  echo "Installing Docker..."
-  curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
-  sh /tmp/get-docker.sh || {
-    echo "ERROR: Docker installation failed, but continuing..."
-    check_docker || echo "WARNING: Docker may not be available"
-  }
+# Setup Docker for VastAI (running inside container)
+if is_in_docker; then
+  echo "Detected VastAI/Docker environment - setting up Docker-in-Docker..."
+  
+  # Check if Docker socket is mounted from host
+  if [ -S /var/run/docker.sock ]; then
+    echo "Docker socket found at /var/run/docker.sock (using host Docker)"
+    
+    # Install Docker CLI if not present
+    if ! command -v docker >/dev/null 2>&1; then
+      echo "Installing Docker CLI..."
+      apt-get update -qq && apt-get install -y -qq docker.io >/dev/null 2>&1 || {
+        curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
+        sh /tmp/get-docker.sh
+      }
+    fi
+    
+    # Verify we can use Docker
+    if docker info >/dev/null 2>&1; then
+      echo "Successfully connected to Docker daemon via socket"
+    else
+      echo "ERROR: Cannot connect to Docker daemon. Checking permissions..."
+      ls -la /var/run/docker.sock
+      echo "Current user: $(whoami), UID: $(id -u), GID: $(id -g)"
+      
+      # Try to fix permissions (VastAI containers typically run as root)
+      if [ "$(id -u)" -eq 0 ]; then
+        chmod 666 /var/run/docker.sock 2>/dev/null || true
+        echo "Adjusted socket permissions"
+      fi
+      
+      # Try again
+      if ! docker info >/dev/null 2>&1; then
+        echo "ERROR: Still cannot connect to Docker daemon"
+        echo "Attempting to start Docker daemon in background..."
+        
+        # Start dockerd in background (for true Docker-in-Docker)
+        dockerd --host=unix:///var/run/docker.sock --host=tcp://0.0.0.0:2375 >/tmp/dockerd.log 2>&1 &
+        DOCKERD_PID=$!
+        echo "Docker daemon started with PID: $DOCKERD_PID"
+        
+        # Wait for daemon to be ready
+        for i in {1..30}; do
+          if docker info >/dev/null 2>&1; then
+            echo "Docker daemon is now ready"
+            break
+          fi
+          echo "Waiting for Docker daemon... attempt $i/30"
+          sleep 2
+        done
+      fi
+    fi
+  else
+    echo "No Docker socket found - starting Docker daemon..."
+    
+    # Install Docker if needed
+    if ! command -v docker >/dev/null 2>&1; then
+      echo "Installing Docker..."
+      curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
+      sh /tmp/get-docker.sh
+    fi
+    
+    # Start Docker daemon in background
+    dockerd --host=unix:///var/run/docker.sock --host=tcp://0.0.0.0:2375 >/tmp/dockerd.log 2>&1 &
+    DOCKERD_PID=$!
+    echo "Docker daemon started with PID: $DOCKERD_PID"
+    
+    # Wait for daemon to be ready
+    for i in {1..30}; do
+      if docker info >/dev/null 2>&1; then
+        echo "Docker daemon is now ready"
+        break
+      fi
+      echo "Waiting for Docker daemon... attempt $i/30"
+      sleep 2
+    done
+  fi
+else
+  echo "Running on bare metal/VM - installing Docker normally..."
+  
+  # Check if Docker is already installed and working
+  if ! check_docker; then
+    echo "Installing Docker..."
+    curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
+    sh /tmp/get-docker.sh || {
+      echo "ERROR: Docker installation failed"
+      exit 1
+    }
+    
+    # Start Docker service
+    systemctl start docker 2>/dev/null || service docker start 2>/dev/null || true
+    sleep 3
+    
+    if ! check_docker; then
+      echo "ERROR: Docker installation succeeded but daemon not running"
+      exit 1
+    fi
+  fi
 fi
+
+# Final verification
+if ! docker info >/dev/null 2>&1; then
+  echo "FATAL ERROR: Docker is not accessible after all setup attempts"
+  echo "Docker info output:"
+  docker info 2>&1 || true
+  exit 1
+fi
+
+echo "Docker setup complete and verified"
 
 # Get instance ID from Vast.ai environment or use hostname
 # Vast.ai doesn't provide a pod ID, so we'll use a combination of hostname and timestamp
@@ -125,25 +228,12 @@ done
 # Remove existing container if it exists
 docker rm -f tensordock-control-plane 2>/dev/null || true
 
-# Configure docker daemon wait helper
-wait_for_docker_daemon() {
-  local max_attempts=20
-  local attempt=0
-  while [ $attempt -lt $max_attempts ]; do
-    if docker info >/dev/null 2>&1; then
-      echo "Docker daemon is running"
-      return 0
-    fi
-    echo "Waiting for Docker daemon... attempt $((attempt + 1))/$max_attempts"
-    systemctl start docker 2>/dev/null || service docker start 2>/dev/null || true
-    sleep 3
-    attempt=$((attempt + 1))
-  done
-  echo "ERROR: Docker daemon did not become ready"
-  return 1
-}
-
-wait_for_docker_daemon || exit 1
+# Verify Docker is still accessible (already checked in main script)
+if ! docker info >/dev/null 2>&1; then
+  echo "ERROR: Docker connection lost"
+  exit 1
+fi
+echo "Docker connection verified"
 
 # Start container
 # Use Vast.ai port mappings: VAST_TCP_PORT_70000 for 8765, VAST_UDP_PORT_70001 for 3478
@@ -182,15 +272,15 @@ chmod +x /opt/tensordock-control-plane/start-control-plane.sh || {
   echo "ERROR: Control plane start script failed"
 }
 
-# Configure firewall (if ufw is available)
-if command -v ufw >/dev/null 2>&1; then
+# Configure firewall (if ufw is available and not in Docker)
+if ! is_in_docker && command -v ufw >/dev/null 2>&1; then
   echo "Configuring firewall..."
   ufw allow 8765/tcp || true
   ufw allow 3478/udp || true
   ufw --force enable || true
   echo "Firewall configured"
 else
-  echo "ufw not available, skipping firewall configuration"
+  echo "Skipping firewall configuration (not needed in container environment)"
 fi
 
 echo "=== Tensordock Setup Completed at $(date) ==="
