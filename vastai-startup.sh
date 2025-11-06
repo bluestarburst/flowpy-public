@@ -11,31 +11,44 @@ echo "  VAST_TCP_PORT_70000: ${VAST_TCP_PORT_70000:-not-set}"
 echo "  VAST_UDP_PORT_70001: ${VAST_UDP_PORT_70001:-not-set}"
 echo "  PUBLIC_IPADDR: ${PUBLIC_IPADDR:-not-set}"
 
-# Wait for network
+# Wait for network (VMs take longer to boot, so timeout is expected)
 wait_for_network() {
   local max_attempts=30
   local attempt=0
+  echo "Waiting for network connectivity (VMs may take longer to boot)..."
   while [ $attempt -lt $max_attempts ]; do
     if ping -c 1 -W 2 8.8.8.8 >/dev/null 2>&1; then
-      echo "Network is available"
+      echo "Network is available (attempt $((attempt + 1)))"
       return 0
     fi
-    echo "Waiting for network... attempt $((attempt + 1))/$max_attempts"
+    if [ $((attempt % 5)) -eq 0 ]; then
+      echo "Waiting for network... attempt $((attempt + 1))/$max_attempts"
+    fi
     sleep 2
     attempt=$((attempt + 1))
   done
-  echo "Warning: Network check timeout, continuing anyway"
+  echo "Network check timeout after $max_attempts attempts (this is normal for VMs during boot) - continuing anyway"
   return 0
 }
 
 wait_for_network
 
-# Check if we're running inside a Docker container (VastAI case)
-is_in_docker() {
-  if [ -f /.dockerenv ] || grep -q docker /proc/1/cgroup 2>/dev/null; then
-    return 0
+# Check if we're running on a VM (VastAI Ubuntu 22.04 VM template)
+# VMs have systemd, containers typically don't
+is_vm() {
+  # Check if systemctl works (VMs have it, containers typically don't)
+  if command -v systemctl >/dev/null 2>&1; then
+    if systemctl --version >/dev/null 2>&1 && systemctl is-system-running >/dev/null 2>&1 2>/dev/null; then
+      return 0  # It's a VM
+    fi
   fi
-  return 1
+  
+  # Check for systemd system directory (VMs have this)
+  if [ -d /run/systemd/system ] && [ -d /sys/fs/cgroup/systemd ]; then
+    return 0  # Likely a VM
+  fi
+  
+  return 1  # Likely a container
 }
 
 # Check if Docker is already installed and working
@@ -55,9 +68,43 @@ check_docker() {
   return 1
 }
 
-# Setup Docker for VastAI (running inside container)
-if is_in_docker; then
-  echo "Detected VastAI/Docker environment - setting up Docker-in-Docker..."
+# Setup Docker based on environment
+if is_vm; then
+  echo "Detected VM environment - using systemd for Docker management"
+  echo "Docker should be pre-installed on VastAI Ubuntu 22.04 VM template"
+  
+  # Docker is pre-installed on VM template, just verify/start it
+  if ! docker info >/dev/null 2>&1; then
+    echo "Docker not running, starting via systemd..."
+    systemctl start docker 2>/dev/null || service docker start 2>/dev/null || true
+    sleep 3
+    
+    if ! docker info >/dev/null 2>&1; then
+      echo "ERROR: Docker failed to start on VM. Checking status..."
+      systemctl status docker 2>&1 | head -20 || true
+      echo "Attempting to install Docker if missing..."
+      
+      # Defensive fallback: install Docker if somehow missing
+      if ! command -v docker >/dev/null 2>&1; then
+        echo "Installing Docker..."
+        curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
+        sh /tmp/get-docker.sh || {
+          echo "ERROR: Docker installation failed"
+          exit 1
+        }
+        systemctl start docker 2>/dev/null || service docker start 2>/dev/null || true
+        sleep 3
+      fi
+      
+      if ! docker info >/dev/null 2>&1; then
+        echo "FATAL ERROR: Docker failed to start on VM after all attempts"
+        exit 1
+      fi
+    fi
+  fi
+  echo "Docker is running and verified"
+else
+  echo "Detected container environment - setting up Docker-in-Docker..."
   
   # Check if Docker socket is mounted from host
   if [ -S /var/run/docker.sock ]; then
@@ -131,27 +178,6 @@ if is_in_docker; then
       echo "Waiting for Docker daemon... attempt $i/30"
       sleep 2
     done
-  fi
-else
-  echo "Running on bare metal/VM - installing Docker normally..."
-  
-  # Check if Docker is already installed and working
-  if ! check_docker; then
-    echo "Installing Docker..."
-    curl -fsSL https://get.docker.com -o /tmp/get-docker.sh
-    sh /tmp/get-docker.sh || {
-      echo "ERROR: Docker installation failed"
-      exit 1
-    }
-    
-    # Start Docker service
-    systemctl start docker 2>/dev/null || service docker start 2>/dev/null || true
-    sleep 3
-    
-    if ! check_docker; then
-      echo "ERROR: Docker installation succeeded but daemon not running"
-      exit 1
-    fi
   fi
 fi
 
@@ -272,15 +298,15 @@ chmod +x /opt/tensordock-control-plane/start-control-plane.sh || {
   echo "ERROR: Control plane start script failed"
 }
 
-# Configure firewall (if ufw is available and not in Docker)
-if ! is_in_docker && command -v ufw >/dev/null 2>&1; then
-  echo "Configuring firewall..."
+# Configure firewall (only on VMs, not in containers)
+if is_vm && command -v ufw >/dev/null 2>&1; then
+  echo "Configuring firewall on VM..."
   ufw allow 8765/tcp || true
   ufw allow 3478/udp || true
   ufw --force enable || true
   echo "Firewall configured"
 else
-  echo "Skipping firewall configuration (not needed in container environment)"
+  echo "Skipping firewall configuration (not needed or not available)"
 fi
 
 echo "=== Tensordock Setup Completed at $(date) ==="
