@@ -202,14 +202,14 @@ if [ -z "$JUPYTER_TOKEN" ]; then
   export JUPYTER_TOKEN=$(head -c 32 /dev/urandom | base64 | tr -dc 'a-zA-Z0-9' | head -c 32 || echo "default-token-$(date +%s)")
 fi
 
-# Create control plane directory
-mkdir -p /opt/tensordock-control-plane || {
-  echo "ERROR: Failed to create control plane directory"
+# Create unified container directory
+mkdir -p /opt/tensordock-unified || {
+  echo "ERROR: Failed to create unified container directory"
   exit 1
 }
 
 # Create start script
-cat > /opt/tensordock-control-plane/start-control-plane.sh << 'STARTSCRIPT'
+cat > /opt/tensordock-unified/start-unified.sh << 'STARTSCRIPT'
 #!/bin/bash
 set -o pipefail
 
@@ -217,21 +217,27 @@ set -o pipefail
 export USER_ID="$USER_ID"
 export INSTANCE_ID="$INSTANCE_ID_VAL"
 export RESOURCE_TYPE="$RESOURCE_TYPE"
-export FIREBASE_CREDENTIALS="$FIREBASE_CREDENTIALS"
+export MONITOR_API_KEY="$MONITOR_API_KEY"
+export FIREBASE_FUNCTIONS_URL="$FIREBASE_FUNCTIONS_URL"
 export START_TURN="$START_TURN"
 export JUPYTER_TOKEN="$JUPYTER_TOKEN"
-export USER_CONTAINER_IMAGE="$USER_CONTAINER_IMAGE"
-export CONTROL_PLANE_IMAGE="$CONTROL_PLANE_IMAGE"
+export TURN_USERNAME="user"
+export TURN_PASSWORD=$(openssl rand -base64 32 2>/dev/null || echo "password")
+export PUBLIC_IPADDR="${PUBLIC_IPADDR:-auto}"
+export UNIFIED_IMAGE="$UNIFIED_IMAGE"
 
 # Validate required variables
 if [ -z "$USER_ID" ] || [ -z "$INSTANCE_ID" ] || [ "$INSTANCE_ID" = "" ]; then
   echo "ERROR: Required environment variables are missing!"
   echo "  USER_ID: [${USER_ID:-<empty>}]"
   echo "  INSTANCE_ID: [${INSTANCE_ID:-<empty>}]"
+  echo "  RESOURCE_TYPE: [${RESOURCE_TYPE:-<empty>}]"
+  echo "  MONITOR_API_KEY: [${MONITOR_API_KEY:+<set>}]"
+  echo "  FIREBASE_FUNCTIONS_URL: [${FIREBASE_FUNCTIONS_URL:-<empty>}]"
   exit 1
 fi
 
-echo "Starting control plane with:"
+echo "Starting unified container with:"
 echo "  USER_ID=$USER_ID"
 echo "  INSTANCE_ID=$INSTANCE_ID"
 echo "  RESOURCE_TYPE=$RESOURCE_TYPE"
@@ -241,7 +247,7 @@ echo "  START_TURN=$START_TURN"
 pull_attempts=0
 max_pull_attempts=3
 while [ $pull_attempts -lt $max_pull_attempts ]; do
-  if docker pull "$CONTROL_PLANE_IMAGE"; then
+  if docker pull "$UNIFIED_IMAGE"; then
     break
   fi
   pull_attempts=$((pull_attempts + 1))
@@ -252,7 +258,7 @@ while [ $pull_attempts -lt $max_pull_attempts ]; do
 done
 
 # Remove existing container if it exists
-docker rm -f tensordock-control-plane 2>/dev/null || true
+docker rm -f tensordock-unified 2>/dev/null || true
 
 # Verify Docker is still accessible (already checked in main script)
 if ! docker info >/dev/null 2>&1; then
@@ -261,41 +267,46 @@ if ! docker info >/dev/null 2>&1; then
 fi
 echo "Docker connection verified"
 
-# Start container
+# Start unified container
 # Use Vast.ai port mappings: VAST_TCP_PORT_70000 for 8765, VAST_UDP_PORT_70001 for 3478
 TURN_PORT=${VAST_UDP_PORT_70001:-3478}
 TENSORDOCK_PORT=${VAST_TCP_PORT_70000:-8765}
+JUPYTER_PORT=8888
 
 docker run -d \
-  --name tensordock-control-plane \
+  --name tensordock-unified \
   --restart unless-stopped \
-  -v /var/run/docker.sock:/var/run/docker.sock \
   -p $TENSORDOCK_PORT:8765 \
+  -p $JUPYTER_PORT:8888 \
   -p $TURN_PORT:3478/udp \
+  -p 49152-65535:49152-65535/udp \
   -e USER_ID="$USER_ID" \
   -e INSTANCE_ID="$INSTANCE_ID" \
   -e RESOURCE_TYPE="$RESOURCE_TYPE" \
-  -e FIREBASE_CREDENTIALS="$FIREBASE_CREDENTIALS" \
+  -e MONITOR_API_KEY="$MONITOR_API_KEY" \
+  -e FIREBASE_FUNCTIONS_URL="$FIREBASE_FUNCTIONS_URL" \
   -e START_TURN="$START_TURN" \
   -e JUPYTER_TOKEN="$JUPYTER_TOKEN" \
-  -e USER_CONTAINER_IMAGE="$USER_CONTAINER_IMAGE" \
-  "$CONTROL_PLANE_IMAGE" || {
-    echo "ERROR: Failed to start control plane container"
+  -e TURN_USERNAME="$TURN_USERNAME" \
+  -e TURN_PASSWORD="$TURN_PASSWORD" \
+  -e PUBLIC_IPADDR="$PUBLIC_IPADDR" \
+  "$UNIFIED_IMAGE" || {
+    echo "ERROR: Failed to start unified container"
     exit 1
   }
 
-echo "Control plane container started successfully"
-echo "Using ports: TCP=$TENSORDOCK_PORT, UDP=$TURN_PORT"
+echo "Unified container started successfully"
+echo "Using ports: TCP=$TENSORDOCK_PORT, Jupyter=$JUPYTER_PORT, UDP=$TURN_PORT"
 STARTSCRIPT
 
-chmod +x /opt/tensordock-control-plane/start-control-plane.sh || {
+chmod +x /opt/tensordock-unified/start-unified.sh || {
   echo "ERROR: Failed to make start script executable"
   exit 1
 }
 
 # Run the start script
-/opt/tensordock-control-plane/start-control-plane.sh || {
-  echo "ERROR: Control plane start script failed"
+/opt/tensordock-unified/start-unified.sh || {
+  echo "ERROR: Unified container start script failed"
 }
 
 # Configure firewall (only on VMs, not in containers)
@@ -310,4 +321,3 @@ else
 fi
 
 echo "=== Tensordock Setup Completed at $(date) ==="
-
